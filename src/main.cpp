@@ -6,8 +6,11 @@
 
     What this template gives you out of the box:
       - USB vs battery auto-detection at boot (via voltage)
+      - Independent sleep cadence for USB and battery modes
       - Battery: latch shutdown + RTC alarm wake (microamp sleep)
-      - USB:    ESP32 deep sleep + timer wake (no hang on USB)
+      - USB:    ESP32 deep sleep + timer wake (no hang on USB,
+                survives mid-sleep unplug via held power latch)
+      - Charging indicator in the title bar when on USB
       - Battery voltage measurement + percentage estimate
       - Orbitron font rendering (Bold 70 / Bold 32 / Medium 20)
       - Sleep glyphs and warning icon helpers
@@ -31,8 +34,12 @@
         use the Preferences (NVS) library to write to flash.
       - On USB, M5.shutdown() hangs forever (the latch can't cut the
         USB-supplied rail). We avoid it by branching to plain ESP32
-        deep sleep, which sleeps the chip without depending on the
-        latch.
+        deep sleep with the power latch (GPIO 12) held HIGH, so an
+        unplug during sleep doesn't strand the device — battery takes
+        over via the latch and the timer-wake still fires.
+      - Plugging USB in while on battery sleep wakes the device
+        immediately (USB rail boots the board), so battery -> USB
+        transitions are instant.
       - The side reset button is the master "recover" mechanism if
         firmware gets stuck — the only guaranteed way out of a bad
         state.
@@ -43,14 +50,19 @@
 #include <M5CoreInk.h>
 #include <esp_adc_cal.h>
 #include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include "Orbitron_Bold_70.h"
 #include "Orbitron_Bold_32.h"
 #include "Orbitron_Medium_20.h"
 
 // =============================================================
-//  TIMING
+//  TIMING — independent cadences for USB and battery modes
 // =============================================================
-const uint32_t SLEEP_MIN = 30; // Sleep interval between measurements (minutes)
+// While charging on USB, you can afford a faster cadence (more
+// frequent updates, more sensor reads). On battery, slower cadence
+// extends life. The mode is detected once per boot.
+const uint32_t SLEEP_MIN_USB = 5;   // Faster cadence while charging
+const uint32_t SLEEP_MIN_BAT = 30;  // Slow cadence on battery for longevity
 
 // =============================================================
 //  POWER MODE DETECTION
@@ -202,6 +214,43 @@ void drawWarningIcon(int cx, int y, int size) {
     canvas.drawPix(mx, y + h - h/4, 0);
 }
 
+// Lightning-bolt charging icon. Drawn as a filled jagged bolt
+// roughly 9 pixels wide and 14 pixels tall. (x, y) is the top-left
+// of its bounding box.
+void drawChargingIcon(int x, int y) {
+    // Top half of the bolt: a downward-pointing wedge
+    // Bottom half: a leftward-pointing wedge
+    // Pixel pattern, 1 = on:
+    //   . . . . X X X X .
+    //   . . . X X X X X .
+    //   . . X X X X X . .
+    //   . X X X X X . . .
+    //   X X X X X X X X .
+    //   . . X X X X X . .
+    //   . . X X X X . . .
+    //   . . X X X . . . .
+    //   . . X X . . . . .
+    static const uint8_t bolt[9] = {
+        0b011110000,
+        0b001111100,
+        0b000111110,  // wider here on purpose — looks chunkier
+        0b000011111,
+        0b011111111,
+        0b000111110,
+        0b000111100,
+        0b000111000,
+        0b000110000
+    };
+    for (int row = 0; row < 9; row++) {
+        for (int col = 0; col < 9; col++) {
+            if (bolt[row] & (1 << (8 - col))) {
+                int px = x + col; int py = y + row;
+                if (px >= 0 && px < 200 && py >= 0 && py < 200) canvas.drawPix(px, py, 0);
+            }
+        }
+    }
+}
+
 // =============================================================
 //  BATTERY
 // =============================================================
@@ -282,7 +331,7 @@ void alarmBeep() {
 // The 200x200 area broken into rough zones used by this template:
 //
 //      0 ─────────────────────────── 200
-//      │   TITLE BAR     [glyph]    │  y =  0 .. 24    (Medium 20)
+//      │   TITLE BAR    [⚡][glyph]  │  y =  0 .. 24    (Medium 20)
 //      │   ─── hRule ───            │  y = 25
 //      │                            │
 //      │     PRIMARY READOUT        │  y = 26 .. 124   (Bold 70 + Bold 32 unit)
@@ -301,13 +350,36 @@ void alarmBeep() {
 //   hRule(y, thickness);
 //   drawRect / fillRect for boxes and bars
 //   drawWarningIcon(cx, y, size) when a threshold is exceeded
+//   drawChargingIcon(x, y) when on USB power (already drawn by template — see below)
 // -----------------------------------------------------------------
-void renderScreen(SleepGlyph glyph = GLYPH_NONE /* TODO: add your measurement params */) {
+void renderScreen(SleepGlyph glyph = GLYPH_NONE, bool onUSB = false /* TODO: add your measurement params */) {
     canvas.clear();
 
     // ----- Title bar -----
     drawGFXString("CORE INK", &Orbitron_Medium_20, 1);   // TODO: LAYOUT — your title
     hRule(25, 2);
+
+    // ============================================================
+    //  CHARGING ICON — drawn here, in the title bar, when onUSB
+    // ============================================================
+    //  Default position: top-right of the title bar, just left of
+    //  the sleep glyph slot.
+    //    x = 162  (9 pixels wide, sits right of any centered title)
+    //    y =   8  (8 pixels of vertical room above hRule at y=25)
+    //
+    //  TO MOVE THIS ELSEWHERE:
+    //    - Change the (x, y) in the drawChargingIcon() call below.
+    //    - The icon's bounding box is 9 wide x 9 tall.
+    //    - Make sure the new spot doesn't collide with the sleep
+    //      glyph (drawn at x=178 in the title bar by default).
+    //  Examples:
+    //    drawChargingIcon(2, 8);    // top-left of title bar
+    //    drawChargingIcon(95, 130); // sandwiched in secondary row
+    //    drawChargingIcon(2, 178);  // tucked into the footer
+    //
+    //  TO HIDE IT ENTIRELY: comment out or delete this block.
+    // ============================================================
+    if (onUSB) drawChargingIcon(162, 8);
 
     // ----- Primary readout area (y=26..124) -----
     // TODO: LAYOUT — example big numeric:
@@ -386,18 +458,26 @@ void scheduleWakeup(uint32_t minutesFromNow) {
     M5.rtc.SetAlarmIRQ(alarm);
 }
 
-// Branch on power source detected at boot.
+// Branch on power source detected at boot. Each mode uses its own
+// cadence (SLEEP_MIN_USB / SLEEP_MIN_BAT).
 //   onUSB == false (battery): M5.shutdown() cuts the rail via the
 //     board's latch; PCF8563 alarm re-powers us. True microamp sleep.
 //   onUSB == true:  M5.shutdown() would hang (no AXP IC, can't cut
-//     the USB rail). Use ESP32 deep sleep with timer wakeup instead —
-//     not as low power, but works fine on USB and self-restarts setup().
+//     the USB rail). Use ESP32 deep sleep with timer wakeup, and
+//     hold GPIO 12 (POWER_HOLD_PIN) HIGH so an unplug during sleep
+//     is survived by battery via the latch.
 void attemptShutdown(bool onUSB) {
     if (onUSB) {
-        esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MIN * 60ULL * 1000000ULL);
+        // Hold the power latch HIGH across deep sleep so unplugging
+        // USB mid-sleep doesn't strand the device.
+        digitalWrite(GPIO_NUM_12, HIGH);
+        gpio_hold_en((gpio_num_t)GPIO_NUM_12);
+        gpio_deep_sleep_hold_en();
+
+        esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MIN_USB * 60ULL * 1000000ULL);
         esp_deep_sleep_start();
     } else {
-        scheduleWakeup(SLEEP_MIN);
+        scheduleWakeup(SLEEP_MIN_BAT);
         delay(200);
         M5.shutdown();
     }
@@ -408,6 +488,14 @@ void attemptShutdown(bool onUSB) {
 // =============================================================
 void setup() {
     delay(500); // STABILIZATION DELAY: critical for USB disconnect reliability
+
+    // Release any leftover GPIO 12 hold from a previous USB-path
+    // sleep. Safe no-op if nothing was held. Must happen before
+    // any later M5.shutdown() that needs to drive GPIO 12 LOW to
+    // cut power on the battery path.
+    gpio_hold_dis((gpio_num_t)GPIO_NUM_12);
+    gpio_deep_sleep_hold_dis();
+
     M5.begin();
 
     // External LED off-by-default. Toggle if you want a brief blink
@@ -422,24 +510,26 @@ void setup() {
     digitalWrite(BUZZER_PIN, LOW);
 
     // Detect power source once, at boot. CoreInk has no AXP IC so
-    // this is the only signal we get; it determines which sleep
-    // mechanism we use at the end of setup().
+    // this is the only signal we get; it determines both the sleep
+    // mechanism and the cadence used at the end of setup().
     bool onUSB = (getBatteryVoltage() > USB_VOLTAGE_THRESHOLD);
 
     // -- TODO: DATA ---------------------------------------------
     // Declare locals to hold this cycle's readings, call your
-    // takeMeasurement(), then pass them into renderScreen().
+    // takeMeasurement(), then pass them into renderScreen() along
+    // with the onUSB flag.
     //
     //   float temperature, humidity;
     //   takeMeasurement(temperature, humidity);
-    //   renderScreen(GLYPH_ZZ, temperature, humidity);
+    //   renderScreen(GLYPH_ZZ, onUSB, temperature, humidity);
     // -----------------------------------------------------------
-    renderScreen(GLYPH_ZZ);
+    renderScreen(GLYPH_ZZ, onUSB);
     delay(500);
 
-    // Sleep until the next cycle. On battery this fully cuts power;
-    // on USB it puts the ESP32 into deep sleep. Either way the
-    // device re-enters setup() from the top on wake.
+    // Sleep until the next cycle, using the per-mode cadence.
+    // Battery path fully cuts power; USB path holds the latch and
+    // does ESP32 deep sleep. Either way the device re-enters
+    // setup() from the top on wake.
     attemptShutdown(onUSB);
 }
 

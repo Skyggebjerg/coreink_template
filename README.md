@@ -4,8 +4,9 @@ A reusable starting point for low-power sensor projects on the
 **M5Stack CoreInk** (200x200 e-ink, ESP32, PCF8563 RTC, no AXP IC).
 Drop this into a new PlatformIO project and fill in the four TODO
 zones to get a working, deep-sleeping sensor display with battery
-percentage, RTC clock, automatic USB-vs-battery detection, and
-Orbitron font rendering.
+percentage, RTC clock, automatic USB-vs-battery detection,
+independent sleep cadence per power source, a charging indicator,
+and Orbitron font rendering.
 
 ## Files
 
@@ -32,8 +33,20 @@ Orbitron font rendering.
     on alarm. True microamp sleep.
   - **USB**: `M5.shutdown()` would hang forever (the latch can't
     cut the USB-supplied rail), so we use plain ESP32 deep sleep
-    with `esp_sleep_enable_timer_wakeup()` instead. Not as low
-    power, but it works on USB and re-enters `setup()` cleanly.
+    with `esp_sleep_enable_timer_wakeup()` instead. Crucially, the
+    template holds GPIO 12 (`POWER_HOLD_PIN`) HIGH across deep
+    sleep, so unplugging USB while the device is asleep does **not**
+    strand it — the battery takes over via the latch and the timer
+    still fires the wake.
+- **Independent cadence per mode.** USB cycles use `SLEEP_MIN_USB`
+  (default 5 min), battery cycles use `SLEEP_MIN_BAT` (default
+  30 min). Lets you have a "snappy while charging, conservative on
+  battery" UX out of the box.
+- **Plug-in transitions are instant.** Plugging USB into a sleeping
+  battery-mode device wakes it immediately (USB rail boots the
+  board), so the device flips to USB cadence with no delay. Unplug
+  transitions take at most one short USB cycle before the slow
+  battery cadence kicks in.
 - **Battery wakes are cold boots.** Because the latch physically
   cuts power, the wake from battery sleep is a full POWERON reset
   — RAM is wiped, and `RTC_DATA_ATTR` variables do **not** survive
@@ -65,6 +78,7 @@ Search `main.cpp` for these tags:
 | Battery sense (ADC1) | GPIO 35 |
 | Buzzer | GPIO 2 |
 | External LED (top) | GPIO 10 |
+| Power latch hold | GPIO 12 (`POWER_HOLD_PIN`) — managed automatically |
 | Grove port | GPIO 32 (RX), GPIO 33 (TX) — also usable as I2C |
 | HY2.0-4P side port | GPIO 25 (SDA), GPIO 26 (SCL) |
 
@@ -73,8 +87,9 @@ Search `main.cpp` for these tags:
 `renderScreen()` is divided into named zones with hRules between them.
 You can use any subset:
 
+```
 0 ─────────────────────────── 200
-│   TITLE BAR     [glyph]    │  y =  0 ..  24   (Orbitron_Medium_20)
+│   TITLE BAR    [⚡][glyph] │  y =  0 ..  24   (Orbitron_Medium_20)
 │   ─── hRule ───            │  y = 25
 │                            │
 │     PRIMARY READOUT        │  y = 26 .. 124   (Orbitron_Bold_70 + Bold_32 unit)
@@ -85,17 +100,25 @@ You can use any subset:
 │   [optional bar/extra]     │  y = 151 .. 174
 │   ─── hRule ───            │  y = 175
 │   HH:MM          NN%       │  y = 176 .. 199  (Orbitron_Medium_20, footer auto-drawn)
+```
+
+The lightning-bolt charging icon (⚡) appears in the title bar when
+the device is on USB power. Default position is `(162, 8)` — top-right
+of the title bar, just left of the sleep glyph slot. The icon's
+bounding box is 9x9 pixels; see the `CHARGING ICON` block inside
+`renderScreen()` for instructions on moving or hiding it.
 
 ## Built-in helpers you don't need to rewrite
 
 - `drawGFXString(str, font, y[, centred=true, x=0, rightEdge=-1])`
 - `hRule(y, thickness=1)`, `drawRect`, `fillRect`
 - `drawWarningIcon(cx, y, size)` — triangle + exclamation
+- `drawChargingIcon(x, y)` — lightning bolt for USB indicator
 - `drawSleepIndicator(x, y)` / `drawMoonIndicator(x, y)` — corner glyphs
 - `getBatteryVoltage()` / `batteryPercent()` (also used for boot-time USB detection)
 - `alarmBeep()` — three short buzzer pulses
 - `scheduleWakeup(minutesFromNow)` — sets the PCF8563 alarm
-- `attemptShutdown(bool onUSB)` — branches between battery latch shutdown and ESP32 deep sleep
+- `attemptShutdown(bool onUSB)` — branches between battery latch shutdown and ESP32 deep sleep with latch hold
 
 ## Failed sensor reads
 
@@ -118,7 +141,12 @@ the `Preferences` library.
    `renderScreen()`, plus your "no data" handling.
 4. Fill in `TODO: LAYOUT` — title and body of `renderScreen()`.
 5. (Optional) Fill in `TODO: ALARM` — thresholds and `alarmBeep()`.
-6. Adjust `SLEEP_MIN` if 30 minutes isn't right for your use case.
+6. Adjust `SLEEP_MIN_USB` and `SLEEP_MIN_BAT` to fit your use case.
+   The defaults (5 / 30 minutes) are conservative starting points;
+   keep the USB cadence reasonable to avoid unnecessary e-ink wear
+   while charging.
 7. (Optional) Calibrate `USB_VOLTAGE_THRESHOLD` for your specific
    unit by reading `getBatteryVoltage()` once on USB and once on a
    fully charged battery, and picking a value between them.
+8. (Optional) Move or hide the charging indicator — see the
+   `CHARGING ICON` comment block inside `renderScreen()`.
