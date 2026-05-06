@@ -4,8 +4,8 @@ A reusable starting point for low-power sensor projects on the
 **M5Stack CoreInk** (200x200 e-ink, ESP32, PCF8563 RTC, no AXP IC).
 Drop this into a new PlatformIO project and fill in the four TODO
 zones to get a working, deep-sleeping sensor display with battery
-percentage, RTC clock, stale-data fallback, and Orbitron font
-rendering.
+percentage, RTC clock, automatic USB-vs-battery detection, and
+Orbitron font rendering.
 
 ## Files
 
@@ -19,23 +19,33 @@ rendering.
 
 ## CoreInk hardware notes (important — these shape the firmware)
 
-- **No AXP IC.** Runtime USB detection is not reliable. USB presence
-  is only knowable at boot via voltage. Don't try to branch firmware
-  behavior on "am I on USB?" at runtime.
-- **`M5.shutdown()` enters deep sleep even when on USB**, but on USB
-  it's effectively a no-op — the device stays awake. The template
-  handles this by always calling `attemptShutdown()` at the end of
-  `setup()` and leaving `loop()` empty. On battery it sleeps; on USB
-  it sits idle until unplugged.
+- **No AXP IC.** USB cannot be detected at runtime. The template
+  works around this by reading the battery sense pin **once at boot**
+  and treating any voltage above `USB_VOLTAGE_THRESHOLD` (default
+  4.26V) as USB power. A real Li-ion cell tops out around 4.2V, so
+  a clearly-higher reading is the USB charge rail showing through.
+  Calibrate this threshold against your own unit if needed.
+- **Two different sleep paths**, picked automatically based on the
+  USB detection above:
+  - **Battery**: `M5.shutdown()` physically cuts the board's power
+    rail via a latch circuit. The PCF8563 RTC re-engages the latch
+    on alarm. True microamp sleep.
+  - **USB**: `M5.shutdown()` would hang forever (the latch can't
+    cut the USB-supplied rail), so we use plain ESP32 deep sleep
+    with `esp_sleep_enable_timer_wakeup()` instead. Not as low
+    power, but it works on USB and re-enters `setup()` cleanly.
+- **Battery wakes are cold boots.** Because the latch physically
+  cuts power, the wake from battery sleep is a full POWERON reset
+  — RAM is wiped, and `RTC_DATA_ATTR` variables do **not** survive
+  across cycles on this board. If you need state across cycles
+  (counters, last-known cache, calibration data), use the
+  `Preferences` library to write to flash. The template does not
+  include any cross-cycle persistence.
 - **The side reset button is the master "recover" mechanism.** It is
   the only guaranteed way out of a stuck state.
-- **Wake source is the on-board PCF8563 RTC alarm.** `scheduleWakeup()`
-  sets it before shutdown.
 - **Display is 200x200, 1-bit.** Drawing happens into a single
   `Ink_Sprite` and is pushed in one go via `canvas.pushSprite()` to
   avoid partial-refresh ghosting.
-- **Persistent state across deep sleep** uses `RTC_DATA_ATTR`. This
-  survives deep sleep but is lost on hard reset / power cycle.
 
 ## Where to plug things in
 
@@ -44,7 +54,7 @@ Search `main.cpp` for these tags:
 | Tag | What goes there |
 |---|---|
 | `TODO: SENSOR` | Pin defines, peripheral setup, and the `readSensor()` driver function. |
-| `TODO: DATA` | Your `RTC_DATA_ATTR` last-known cache variables and the locals passed into `takeMeasurement()` / `renderScreen()`. |
+| `TODO: DATA` | Locals for the current cycle's readings and the call into `takeMeasurement()` / `renderScreen()`. On a failed read, decide how to represent "no data" (NaN, zero, sentinel). |
 | `TODO: LAYOUT` | Title text and the body of `renderScreen()`. The function has zone comments showing the y-coordinate budget. |
 | `TODO: ALARM` | Threshold constants and `alarmBeep()` calls inside `takeMeasurement()`. |
 
@@ -63,7 +73,6 @@ Search `main.cpp` for these tags:
 `renderScreen()` is divided into named zones with hRules between them.
 You can use any subset:
 
-```
 0 ─────────────────────────── 200
 │   TITLE BAR     [glyph]    │  y =  0 ..  24   (Orbitron_Medium_20)
 │   ─── hRule ───            │  y = 25
@@ -76,35 +85,40 @@ You can use any subset:
 │   [optional bar/extra]     │  y = 151 .. 174
 │   ─── hRule ───            │  y = 175
 │   HH:MM          NN%       │  y = 176 .. 199  (Orbitron_Medium_20, footer auto-drawn)
-```
 
 ## Built-in helpers you don't need to rewrite
 
 - `drawGFXString(str, font, y[, centred=true, x=0, rightEdge=-1])`
 - `hRule(y, thickness=1)`, `drawRect`, `fillRect`
 - `drawWarningIcon(cx, y, size)` — triangle + exclamation
-- `drawStaleMarker(x, y)` — small X for stale data
 - `drawSleepIndicator(x, y)` / `drawMoonIndicator(x, y)` — corner glyphs
-- `getBatteryVoltage()` / `batteryPercent()`
+- `getBatteryVoltage()` / `batteryPercent()` (also used for boot-time USB detection)
 - `alarmBeep()` — three short buzzer pulses
-- `scheduleWakeup(minutesFromNow)` / `attemptShutdown()`
+- `scheduleWakeup(minutesFromNow)` — sets the PCF8563 alarm
+- `attemptShutdown(bool onUSB)` — branches between battery latch shutdown and ESP32 deep sleep
 
-## Stale-data behavior (already wired up)
+## Failed sensor reads
 
-When `readSensor()` fails, `takeMeasurement()` should fall back to the
-cached `last*` values and increment `consecutiveReadFailures`. After
-`STALE_DATA_FAIL_THRESHOLD` (default 3) consecutive failures,
-`renderScreen()` automatically draws a small X marker in the top-left
-of the title bar so the user knows the displayed numbers are stale.
-A successful read resets the counter to 0.
+Each measurement cycle is independent. If `readSensor()` fails, your
+`takeMeasurement()` wrapper should fill the out-parameters with
+something the renderer can recognize as "no data" — `NAN` is a good
+default for floats since it's easy to test for with `isnan()` and won't
+be confused with a real reading. The renderer can then show a dash
+or a placeholder instead of a number for that field. There is no
+cached "last known good" value because RAM does not survive sleep on
+this board; if you want that behavior, add NVS-backed caching via
+the `Preferences` library.
 
 ## How to bootstrap a new project from this template
 
 1. Copy `main.cpp`, `platformio.ini`, and the three Orbitron `.h`
    files into a new PlatformIO project (`src/` and project root).
 2. Fill in `TODO: SENSOR` — pin defines and `readSensor()`.
-3. Fill in `TODO: DATA` — `RTC_DATA_ATTR last*` variables and the
-   parameter list of `takeMeasurement()` and `renderScreen()`.
+3. Fill in `TODO: DATA` — parameter list of `takeMeasurement()` and
+   `renderScreen()`, plus your "no data" handling.
 4. Fill in `TODO: LAYOUT` — title and body of `renderScreen()`.
 5. (Optional) Fill in `TODO: ALARM` — thresholds and `alarmBeep()`.
 6. Adjust `SLEEP_MIN` if 30 minutes isn't right for your use case.
+7. (Optional) Calibrate `USB_VOLTAGE_THRESHOLD` for your specific
+   unit by reading `getBatteryVoltage()` once on USB and once on a
+   fully charged battery, and picking a value between them.

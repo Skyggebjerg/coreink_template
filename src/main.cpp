@@ -5,31 +5,37 @@
     M5Stack CoreInk (200x200 e-ink, ESP32, RTC, no AXP IC).
 
     What this template gives you out of the box:
-      - Deep-sleep cycle driven by the on-board PCF8563 RTC alarm
+      - USB vs battery auto-detection at boot (via voltage)
+      - Battery: latch shutdown + RTC alarm wake (microamp sleep)
+      - USB:    ESP32 deep sleep + timer wake (no hang on USB)
       - Battery voltage measurement + percentage estimate
       - Orbitron font rendering (Bold 70 / Bold 32 / Medium 20)
-      - Persistent state across deep sleep via RTC_DATA_ATTR
-      - Stale-data marker, sleep glyphs, warning icon helpers
+      - Sleep glyphs and warning icon helpers
       - Buzzer + external LED pin definitions
       - Time + battery footer rendered automatically
 
     What you need to fill in for a new project:
-      - Sensor wiring + driver code  (search: "TODO: SENSOR")
-      - Measurement struct + last-known cache  (search: "TODO: DATA")
-      - Title and main-area screen layout    (search: "TODO: LAYOUT")
+      - Sensor wiring + driver code           (search: "TODO: SENSOR")
+      - Measurement struct                    (search: "TODO: DATA")
+      - Title and main-area screen layout     (search: "TODO: LAYOUT")
       - Optional alarm thresholds and beeping (search: "TODO: ALARM")
 
     Hardware notes (CoreInk specifics — keep these in mind):
-      - There is NO AXP power IC, so runtime USB detection is not
-        reliable. USB presence is only known at boot via voltage.
-      - M5.shutdown() enters deep sleep even when on USB. On USB it
-        is effectively a no-op; loop() will run idle until unplugged
-        and the side power button is pressed for a real sleep cycle.
+      - There is NO AXP power IC. USB cannot be detected at runtime;
+        we infer it once at boot from battery voltage (USB rail reads
+        higher than any real cell can).
+      - On battery, M5.shutdown() physically cuts the power rail via
+        a latch and the PCF8563 RTC re-engages the latch on alarm.
+        This is a true cold boot on wake — RAM is wiped, RTC_DATA_ATTR
+        variables do NOT survive. If you need state across cycles,
+        use the Preferences (NVS) library to write to flash.
+      - On USB, M5.shutdown() hangs forever (the latch can't cut the
+        USB-supplied rail). We avoid it by branching to plain ESP32
+        deep sleep, which sleeps the chip without depending on the
+        latch.
       - The side reset button is the master "recover" mechanism if
-        firmware gets stuck — it is the only guaranteed way out of
-        a bad state.
-      - Deep sleep is woken by the RTC alarm we schedule before
-        shutdown.
+        firmware gets stuck — the only guaranteed way out of a bad
+        state.
       - Display is 200x200, 1-bit. Drawing happens into Ink_Sprite
         and is pushed in one go to avoid partial refresh ghosting.
    ============================================================ */
@@ -44,7 +50,16 @@
 // =============================================================
 //  TIMING
 // =============================================================
-const uint32_t SLEEP_MIN = 30; // Deep-sleep interval between measurements (minutes)
+const uint32_t SLEEP_MIN = 30; // Sleep interval between measurements (minutes)
+
+// =============================================================
+//  POWER MODE DETECTION
+// =============================================================
+// CoreInk has no AXP IC, so runtime USB detection isn't possible.
+// At boot we read the battery sense pin: a real Li-ion cell tops
+// out at ~4.2V, so anything noticeably above that is the USB charge
+// rail leaking through. Calibrate this against your own unit.
+const float USB_VOLTAGE_THRESHOLD = 4.26f;
 
 // =============================================================
 //  PINS
@@ -70,27 +85,6 @@ const uint32_t SLEEP_MIN = 30; // Deep-sleep interval between measurements (minu
 //   #define SENSOR_SDA 25
 //   #define SENSOR_SCL 26
 //   #define SENSOR_I2C_ADDR 0x76
-// -----------------------------------------------------------------
-
-// =============================================================
-//  PERSISTENT STATE (survives deep sleep, lost on hard reset)
-// =============================================================
-RTC_DATA_ATTR uint32_t bootCount = 0;
-RTC_DATA_ATTR uint32_t consecutiveReadFailures = 0;
-
-// After this many consecutive failed sensor reads, the screen shows
-// a stale-data marker (small X in the top-left of the title bar).
-const uint32_t STALE_DATA_FAIL_THRESHOLD = 3;
-
-// -- TODO: DATA ---------------------------------------------------
-// Replace these with the readings your sensor produces. Anything you
-// want to keep across deep-sleep (so you can show the last known
-// value when a read fails) must be RTC_DATA_ATTR.
-//
-// Example:
-//   RTC_DATA_ATTR float lastTemperature = 0.0f;
-//   RTC_DATA_ATTR float lastHumidity    = 0.0f;
-//   RTC_DATA_ATTR float lastPressure    = 1013.0f;
 // -----------------------------------------------------------------
 
 // =============================================================
@@ -186,18 +180,6 @@ void drawMoonIndicator(int x, int y) {
     }
 }
 
-// Small X mark — drawn when sensor reads have been failing for a
-// while so the user knows the displayed values are stale.
-void drawStaleMarker(int x, int y) {
-    const int sz = 10;
-    for (int i = 0; i < sz; i++) {
-        canvas.drawPix(x + i,          y + i,     0);
-        canvas.drawPix(x + i,          y + i + 1, 0);
-        canvas.drawPix(x + sz - 1 - i, y + i,     0);
-        canvas.drawPix(x + sz - 1 - i, y + i + 1, 0);
-    }
-}
-
 // Triangle warning sign with exclamation mark. Useful for threshold
 // alarms. cx = horizontal center, y = top, size = half-base width.
 void drawWarningIcon(int cx, int y, int size) {
@@ -226,6 +208,7 @@ void drawWarningIcon(int cx, int y, int size) {
 
 // Returns battery voltage in volts. Uses ADC1 with calibrated
 // characterization and the CoreInk's 25.1k / 5.1k divider.
+// Also used at boot for USB detection.
 float getBatteryVoltage() {
     static esp_adc_cal_characteristics_t adc_chars;
     static bool characterized = false;
@@ -241,7 +224,8 @@ float getBatteryVoltage() {
 }
 
 // 0–100% estimate using a simple linear 3.2V–4.2V mapping. Fine for
-// a status footer; not a fuel gauge.
+// a status footer; not a fuel gauge. Note: while on USB this will
+// read >100% before clamping, since USB voltage > 4.2V.
 int batteryPercent() {
     float v = getBatteryVoltage();
     return constrain((int)(((v - 3.2f) / (4.2f - 3.2f)) * 100.0f), 0, 100);
@@ -265,11 +249,11 @@ void alarmBeep() {
 
 // -- TODO: SENSOR --------------------------------------------------
 // Implement your sensor read here. Return true on success and fill
-// the out-parameters; return false if the read failed (the caller
-// will substitute the last cached values and increment the
-// failure counter).
+// the out-parameters; return false if the read failed.
 //
-// Keep the signature shape consistent with takeMeasurement() below.
+// On failure the caller (takeMeasurement) decides how to present
+// the missing data — typical choices are zeros, NaN, or a sentinel
+// value the renderer recognizes and shows as a dash.
 //
 // Example (UART sensor):
 //   bool readSensor(float& temperature, float& humidity) {
@@ -299,16 +283,16 @@ void alarmBeep() {
 //
 //      0 ─────────────────────────── 200
 //      │   TITLE BAR     [glyph]    │  y =  0 .. 24    (Medium 20)
-//      │   ─── hRule ───             │  y = 25
-//      │                             │
-//      │     PRIMARY READOUT         │  y = 26 .. 124   (Bold 70 + Bold 32 unit)
-//      │                             │
-//      │   ─── hRule ───             │  y = 125
-//      │   secondary L  secondary R  │  y = 125 .. 149  (Medium 20)
-//      │   ─── hRule ───             │  y = 150
-//      │   [optional bar/extra]      │  y = 151 .. 174
-//      │   ─── hRule ───             │  y = 175
-//      │   HH:MM          NN%        │  y = 176 .. 199  (Medium 20)
+//      │   ─── hRule ───            │  y = 25
+//      │                            │
+//      │     PRIMARY READOUT        │  y = 26 .. 124   (Bold 70 + Bold 32 unit)
+//      │                            │
+//      │   ─── hRule ───            │  y = 125
+//      │   secondary L  secondary R │  y = 125 .. 149  (Medium 20)
+//      │   ─── hRule ───            │  y = 150
+//      │   [optional bar/extra]     │  y = 151 .. 174
+//      │   ─── hRule ───            │  y = 175
+//      │   HH:MM          NN%       │  y = 176 .. 199  (Medium 20)
 //
 // Helpful primitives already available:
 //   drawGFXString(text, &Orbitron_Bold_70,   y);                       // centered
@@ -317,7 +301,6 @@ void alarmBeep() {
 //   hRule(y, thickness);
 //   drawRect / fillRect for boxes and bars
 //   drawWarningIcon(cx, y, size) when a threshold is exceeded
-//   drawStaleMarker(4, 6) when consecutiveReadFailures >= STALE_DATA_FAIL_THRESHOLD
 // -----------------------------------------------------------------
 void renderScreen(SleepGlyph glyph = GLYPH_NONE /* TODO: add your measurement params */) {
     canvas.clear();
@@ -325,11 +308,6 @@ void renderScreen(SleepGlyph glyph = GLYPH_NONE /* TODO: add your measurement pa
     // ----- Title bar -----
     drawGFXString("CORE INK", &Orbitron_Medium_20, 1);   // TODO: LAYOUT — your title
     hRule(25, 2);
-
-    // Stale-data marker (top-left of title bar) when reads have been
-    // failing — values shown are last-known cache.
-    if (consecutiveReadFailures >= STALE_DATA_FAIL_THRESHOLD)
-        drawStaleMarker(4, 6);
 
     // ----- Primary readout area (y=26..124) -----
     // TODO: LAYOUT — example big numeric:
@@ -374,24 +352,20 @@ void renderScreen(SleepGlyph glyph = GLYPH_NONE /* TODO: add your measurement pa
 // =============================================================
 
 // -- TODO: DATA + ALARM -------------------------------------------
-// Wrap your readSensor() call so the caller gets either a fresh
-// reading or the last known cached values, and so that consecutive
-// failures get tracked (this drives the stale-data marker).
+// Wrap your readSensor() call. Each cycle is independent — there's
+// no cross-cycle cache, so on a failed read you decide how to
+// present "no data" (zeros, NaN, sentinel for "--", whatever your
+// renderer expects).
 //
 // Example shape:
 //
 //   void takeMeasurement(float& temperature, float& humidity) {
 //       if (!readSensor(temperature, humidity)) {
-//           temperature = lastTemperature;
-//           humidity    = lastHumidity;
-//           consecutiveReadFailures++;
-//       } else {
-//           lastTemperature = temperature;
-//           lastHumidity    = humidity;
-//           consecutiveReadFailures = 0;
+//           temperature = NAN;
+//           humidity    = NAN;
 //       }
 //       // TODO: ALARM — beep on threshold breach, e.g.:
-//       //   if (temperature > TEMP_ALARM_C) alarmBeep();
+//       //   if (!isnan(temperature) && temperature > TEMP_ALARM_C) alarmBeep();
 //   }
 // -----------------------------------------------------------------
 
@@ -400,7 +374,7 @@ void renderScreen(SleepGlyph glyph = GLYPH_NONE /* TODO: add your measurement pa
 // =============================================================
 
 // Schedule the PCF8563 RTC to wake us up after `minutesFromNow`
-// minutes. Wraps across midnight.
+// minutes. Wraps across midnight. Used for the battery path.
 void scheduleWakeup(uint32_t minutesFromNow) {
     RTC_TimeTypeDef rt; M5.rtc.GetTime(&rt);
     int totalMin = rt.Hours * 60 + rt.Minutes + (int)minutesFromNow;
@@ -412,13 +386,21 @@ void scheduleWakeup(uint32_t minutesFromNow) {
     M5.rtc.SetAlarmIRQ(alarm);
 }
 
-// On battery: cuts power, RTC wakes us at the alarm.
-// On USB:    no-op; we'll sit idle in loop() until unplugged and the
-//            side power button is pressed for a real sleep cycle.
-void attemptShutdown() {
-    scheduleWakeup(SLEEP_MIN);
-    delay(200);
-    M5.shutdown();
+// Branch on power source detected at boot.
+//   onUSB == false (battery): M5.shutdown() cuts the rail via the
+//     board's latch; PCF8563 alarm re-powers us. True microamp sleep.
+//   onUSB == true:  M5.shutdown() would hang (no AXP IC, can't cut
+//     the USB rail). Use ESP32 deep sleep with timer wakeup instead —
+//     not as low power, but works fine on USB and self-restarts setup().
+void attemptShutdown(bool onUSB) {
+    if (onUSB) {
+        esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_MIN * 60ULL * 1000000ULL);
+        esp_deep_sleep_start();
+    } else {
+        scheduleWakeup(SLEEP_MIN);
+        delay(200);
+        M5.shutdown();
+    }
 }
 
 // =============================================================
@@ -427,7 +409,6 @@ void attemptShutdown() {
 void setup() {
     delay(500); // STABILIZATION DELAY: critical for USB disconnect reliability
     M5.begin();
-    bootCount++;
 
     // External LED off-by-default. Toggle if you want a brief blink
     // to confirm a wake-cycle started.
@@ -440,6 +421,11 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
+    // Detect power source once, at boot. CoreInk has no AXP IC so
+    // this is the only signal we get; it determines which sleep
+    // mechanism we use at the end of setup().
+    bool onUSB = (getBatteryVoltage() > USB_VOLTAGE_THRESHOLD);
+
     // -- TODO: DATA ---------------------------------------------
     // Declare locals to hold this cycle's readings, call your
     // takeMeasurement(), then pass them into renderScreen().
@@ -451,16 +437,10 @@ void setup() {
     renderScreen(GLYPH_ZZ);
     delay(500);
 
-    // CoreInk has no AXP IC and no runtime USB detection, so battery-
-    // percent tricks for "am I on USB?" are unreliable. We always
-    // attempt deep sleep:
-    //   - On battery: M5.shutdown() cuts power and the RTC alarm
-    //                 wakes us.
-    //   - On USB:     M5.shutdown() is a no-op; loop() stays empty
-    //                 and the device sits idle until unplugged and
-    //                 the side power button is pressed for a proper
-    //                 sleep cycle.
-    attemptShutdown();
+    // Sleep until the next cycle. On battery this fully cuts power;
+    // on USB it puts the ESP32 into deep sleep. Either way the
+    // device re-enters setup() from the top on wake.
+    attemptShutdown(onUSB);
 }
 
 void loop() {}
