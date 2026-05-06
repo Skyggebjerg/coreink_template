@@ -512,6 +512,7 @@ void setup() {
     // Detect power source once, at boot. CoreInk has no AXP IC so
     // this is the only signal we get; it determines both the sleep
     // mechanism and the cadence used at the end of setup().
+    delay(500); // brief delay to stabilize ADC reading for USB detection
     bool onUSB = (getBatteryVoltage() > USB_VOLTAGE_THRESHOLD);
 
     // -- TODO: DATA ---------------------------------------------
